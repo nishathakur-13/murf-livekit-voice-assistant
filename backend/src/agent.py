@@ -1,3 +1,4 @@
+
 import logging
 
 from dotenv import load_dotenv
@@ -59,6 +60,7 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
+    logger.warning("========== my_agent CALLED ==========")
     # Logging setup
     # Add any other context you want in all log entries here
     ctx.log_context_fields = {

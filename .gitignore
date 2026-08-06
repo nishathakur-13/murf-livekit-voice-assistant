@@ -2,3 +2,47 @@
 .env.*
 !.env.example
 .DS_Store
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+.env.local
+
+# Node
+node_modules/
+dist/
+.next/
+.vite/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+
+# Build
+build/
+coverage/
+
+# Colab
+.ipynb_checkpoints/
+
+# Secrets
+*.pem
+*.key
+
+# Temporary
+tmp/
+temp/
