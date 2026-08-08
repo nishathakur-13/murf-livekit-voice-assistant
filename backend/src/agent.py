@@ -13,15 +13,12 @@ from livekit.agents import (
     tokenize,
     room_io,
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
+from livekit.plugins import murf, silero, google, deepgram, noise_cancellation, openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
 
-load_dotenv(".env.local")
-import os
-
-os.environ["GOOGLE_API_KEY"] 
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env.local"))
 
 # Change this prompt to change what your voice agent does.
 # See README.md for example prompts (customer support, language tutor, receptionist).
@@ -185,7 +182,7 @@ FIRST GREETING
 ========================
 Whenever a new conversation starts, say:
 
-"Namaste! Main KrishiMitra AI hoon. Main kheti, faslon, sinchai, mitti ki sehat aur sarkari krishi yojanaon se judi general jankari dene ke liye yahan hoon. Aaj main aapki kis baat mein madad kar sakta hoon?"
+"Namaste! Main KrishiMitra AI hoon. Main kheti, crops,  seechaai, mitti ki sehat aur sarkari krishi yojanaon se judi general jankari dene ke liye yahan hoon. Aaj main aapki kis trh madad kar sakti hoon?"
 
 ========================
 EXAMPLES
@@ -193,6 +190,7 @@ EXAMPLES
 
 User:
 Meri dhan ki fasal peele rang ki ho rahi hai.
+
 
 Reply:
 Achha, samajh gaya. Iski kai wajah ho sakti hain jaise nutrient deficiency ya kisi rog ka shuruaati asar. Kya ye poore khet me hai ya sirf kuch jagah?
@@ -268,15 +266,18 @@ async def my_agent(ctx: JobContext):
             stt=deepgram.STT(model="nova-3"),
             # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
             # See all available models at https://docs.livekit.io/agents/models/llm/
-            llm = google.LLM(
-                model="gemini-3.6-flash"
+            llm=openai.LLM(
+                model="llama-3.3-70b-versatile",
+                api_key=os.getenv("GROQ_API_KEY"),
+                base_url="https://api.groq.com/openai/v1",
             ),
             # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
             # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
             # Nikhil is a male Indian English/Hindi voice from Murf's voice library
             tts=murf.TTS(
-                    voice="Nikhil",
+                    voice="en-IN-anisha",
                     locale="en-IN",
+                    style="Conversational",
                     tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
                     text_pacing=True
                 ),
