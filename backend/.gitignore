@@ -11,6 +11,10 @@ KMS
 .pytest_cache
 .ruff_cache
 
+# SQLite database (contains user data — never commit)
+*.db
+*.sqlite
+
 # Claude Code
 .claude/settings.local.json
 .claude/worktrees/
