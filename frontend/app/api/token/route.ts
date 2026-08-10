@@ -45,9 +45,13 @@ export async function POST(req: Request) {
     }
       
     // Generate participant token
+    // participantIdentity is fixed per "user" (stored in browser via request body),
+    // so the backend can recognise returning callers.
+    // roomName is unique per call (identity + timestamp) to avoid LiveKit room conflicts.
     const participantName = 'user';
-    const participantIdentity = `voice_assistant_user_${Math.floor(Math.random() * 10_000)}`;
-    const roomName = `voice_assistant_room_${Math.floor(Math.random() * 10_000)}`;
+    const participantIdentity = body?.identity || `voice_assistant_user_dev_1`;
+    // Fresh room every call, but identity stays the same → agent looks up by identity
+    const roomName = `krishimitra_${participantIdentity}_${Date.now()}`;
 
     const participantToken = await createParticipantToken(
       { identity: participantIdentity, name: participantName },

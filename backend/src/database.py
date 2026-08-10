@@ -28,6 +28,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "krishimitra_memory.db")
 # Connection helper
 # ---------------------------------------------------------------------------
 
+
 def _get_connection() -> sqlite3.Connection:
     """Return a thread-safe SQLite connection with row_factory set."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -38,6 +39,7 @@ def _get_connection() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 # Schema bootstrap
 # ---------------------------------------------------------------------------
+
 
 def init_db() -> None:
     """Create the users table if it does not already exist."""
@@ -63,6 +65,7 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 # CRUD helpers
 # ---------------------------------------------------------------------------
+
 
 def get_user(user_id: str) -> dict | None:
     """

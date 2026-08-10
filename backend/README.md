@@ -134,6 +134,29 @@ You are an enthusiastic trivia game host. Ask the user one trivia question at a 
 You are a gentle, non-clinical wellness companion. Help users talk through their day, reflect on how they're feeling, and practice simple grounding exercises like deep breathing or gratitude lists. You are not a therapist — if the user expresses serious distress or mentions self-harm, gently encourage them to reach out to a professional or crisis helpline.
 ```
 
+### Mandi Price Lookup (Day 5 — Real Data Tool)
+
+KrishiMitra uses the **Agmarknet dataset** from [data.gov.in](https://data.gov.in/resource/variety-wise-daily-market-prices-data-commodity) to look up real wholesale mandi prices.
+
+| Property | Detail |
+|---|---|
+| Data source | [Agmarknet via data.gov.in](https://data.gov.in/resource/variety-wise-daily-market-prices-data-commodity) — Government of India, Ministry of Agriculture |
+| Data type | **Live government data** (not a local/hardcoded dataset) |
+| Update frequency | Daily, published by APMC mandis |
+| Freshness lag | Typically **1–3 days** behind actual trade dates — Agmarknet publishes as mandis report |
+| API | REST, JSON, free with registration at data.gov.in |
+| Authentication | `DATA_GOV_API_KEY` env variable (falls back to public demo key if unset) |
+
+**Spoken data freshness:** When the agent speaks a mandi price, it always mentions the date the record is from (e.g. "Yeh data 8 August ka hai"). This is deliberate — yesterday's rate and today's rate may be different selling decisions for a farmer.
+
+**Graceful failure:** If the API is unreachable (timeout, HTTP error, no records), the agent says something like: "Abhi mandi ka data nahi mil raha — net ya server ki dikkat ho sakti hai. Kuch der baad try karein, ya apne najdeeki APMC se pata kar lein." It never hallucinates a price.
+
+**Advanced — district chaining:** If the farmer's district was saved in Day 4 memory, the `get_mandi_price` tool automatically uses it without asking again.
+
+To use your own API key:
+1. Register free at [data.gov.in](https://data.gov.in/user/register)
+2. Add to `.env.local`: `DATA_GOV_API_KEY=your_key_here`
+
 ### Voice
 
 Set the `voice` argument in the `murf.TTS(...)` call:
