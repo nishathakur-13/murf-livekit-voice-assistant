@@ -257,3 +257,111 @@ backend/
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## Day 6 — Outbound Calls (Telephony)
+
+KrishiMitra can now **make outbound calls** to farmers, delivering a daily farming tip over the phone. This is the Learning & Literacy use case: a scheduled call that reaches the farmer proactively instead of waiting for them to call in.
+
+### How it works
+
+```
+outbound_call.py
+  → LiveKit: create room + dispatch agent (with phone_number in metadata)
+    → agent.py: receives job, reads phone_number from metadata
+      → LiveKit SIP: create_sip_participant (outbound trunk → Twilio → PSTN)
+        → farmer's phone rings → farmer answers
+          → agent delivers: who is calling + why + how to stop + farming tip
+```
+
+The agent uses Murf Falcon TTS (voice: Anisha, Indian English) — same voice as the inbound agent.
+
+### Prerequisites
+
+1. **Twilio account** with an Elastic SIP Trunk  
+   - [console.twilio.com](https://console.twilio.com) → Elastic SIP Trunking → Create trunk  
+   - Termination tab → note the SIP URI (e.g. `mytrunk.pstn.twilio.com`)  
+   - Create a credential list (username + password), attach to the trunk  
+   - Buy or port a Twilio phone number for caller ID  
+
+2. **LiveKit Cloud** project (you already have this)
+
+### Step 1: Configure environment
+
+Add to `backend/.env.local`:
+
+```env
+# Twilio SIP Termination URI (from Twilio elastic trunk → Termination tab)
+TWILIO_SIP_TERM_URI=mytrunk.pstn.twilio.com
+
+# Credential list username/password attached to the Twilio trunk
+TWILIO_SIP_USERNAME=your-credential-list-username
+TWILIO_SIP_PASSWORD=your-credential-list-password
+
+# Twilio phone number (caller ID), E.164 format
+TWILIO_PHONE_NUMBER=+12015551234
+```
+
+### Step 2: Create the LiveKit outbound SIP trunk (once)
+
+```bash
+uv run python src/setup_outbound_trunk.py
+```
+
+Copy the printed `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` into `.env.local`:
+
+```env
+LIVEKIT_SIP_OUTBOUND_TRUNK_ID=ST_xxxxxxxxxxxxxxxxxxxx
+```
+
+### Step 3: Start the agent worker
+
+```bash
+uv run python src/agent.py start
+```
+
+The agent listens for dispatched jobs. Use `start` (not `dev`) for phone testing — `dev` connects to the LiveKit playground browser UI, not SIP.
+
+### Step 4: Trigger an outbound call
+
+```bash
+# Single call — basic
+uv run python src/outbound_call.py --to +919876543210
+
+# Single call — with a specific farming topic
+uv run python src/outbound_call.py --to +919876543210 --topic "kharif crop soil preparation"
+
+# Dry run — see what would happen without placing a real call
+uv run python src/outbound_call.py --to +919876543210 --dry-run
+```
+
+### Opening statement (Day 6 requirement)
+
+Every outbound call opens with a mandatory three-part disclosure — who is calling, why, and how to stop:
+
+> "Namaste! Main KrishiMitra AI hoon, ek automated farming assistant.
+> Main aapko aaj ka farming tip dene ke liye call kar rahi hoon — topic hai: [topic].
+> Agar aap yeh call nahi chahte, to bas 'band karo' ya 'stop' bolein aur main turant call khatam kar dungi.
+> Kya aap tayaar hain?"
+
+### Outcome handling
+
+| Outcome | SIP code | What happens |
+|---|---|---|
+| Call answered | 200 OK | Agent delivers the tip and has a conversation |
+| Call rejected / busy | 486, 603 | `SipCallError` raised, job shut down, logged as `USER_REJECTED` |
+| No answer / timeout | 408, 480 | `SipCallError` raised, job shut down, logged as `NO_ANSWER` |
+| Trunk failure | 5xx | `SipCallError` raised, job shut down, logged as `TRUNK_FAILURE` |
+| Mid-call hang-up | CLIENT_INITIATED | `participant_disconnected` event, logged as `COMPLETED` |
+
+### New files
+
+| File | Purpose |
+|---|---|
+| `src/outbound_call.py` | CLI trigger — dispatches agent with phone number + topic |
+| `src/setup_outbound_trunk.py` | One-time script to register Twilio SIP trunk with LiveKit |
+
+### Linphone alternative (if Twilio trial is exhausted)
+
+If your Twilio free trial is used up, you can test locally using [Linphone](https://linphone.org/en/) as a SIP softphone. See `../supplementary/outbound-over-linphone.md` for the Linphone-specific SIP trunk configuration.

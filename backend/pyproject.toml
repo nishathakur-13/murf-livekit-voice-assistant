@@ -11,7 +11,9 @@ requires-python = ">=3.10, <3.15"
 dependencies = [
     "ddgs>=9.14.4",
     "duckduckgo-search>=8.1.1",
+    "livekit>=0.20.0",
     "livekit-agents[deepgram,google,openai,silero,turn-detector]~=1.4",
+    "livekit-api>=0.8.0",
     "livekit-murf>=0.1.1",
     "livekit-plugins-noise-cancellation~=0.2",
     "python-dotenv",

@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 from ddgs import DDGS
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -485,6 +486,131 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# ---------------------------------------------------------------------------
+# Outbound call helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_outbound_metadata(ctx: JobContext) -> dict:
+    """Parse outbound call metadata from the job.  Returns {} if not present."""
+    raw = getattr(ctx.job, "metadata", None) or ""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+async def _place_outbound_call(ctx: JobContext, meta: dict) -> str | None:
+    """
+    Place an outbound SIP call using Linphone inline trunk configuration.
+
+    Uses LiveKit's inline trunk config — no stored trunk or Twilio needed.
+    Credentials + target SIP address come from the job metadata dispatched
+    by outbound_call.py.
+
+    Returns the participant identity on success, None on failure.
+    """
+    from livekit.api.twirp_client import TwirpError
+    from livekit.protocol.sip import (
+        CreateSIPParticipantRequest,
+        SIPMediaEncryption,
+        SIPOutboundConfig,
+        SIPTransport,
+    )
+    from google.protobuf.duration_pb2 import Duration
+
+    sip_address = meta.get("linphone_sip_address", "").strip().removeprefix("sip:")
+    username = meta.get("linphone_username", "").strip()
+    password = meta.get("linphone_password", "").strip()
+
+    if not sip_address:
+        logger.error("linphone_sip_address missing in job metadata — cannot dial")
+        ctx.shutdown()
+        return None
+
+    # hostname is the domain part (e.g. sip.linphone.org)
+    sip_hostname = sip_address.split("@")[-1] if "@" in sip_address else "sip.linphone.org"
+    # user part only — LiveKit builds the full INVITE as sip:<sip_user>@<trunk hostname>
+    sip_user = sip_address.split("@")[0] if "@" in sip_address else sip_address
+    # sip_number = caller-id (From header) — must also be just the username, not a full URI
+    sip_from = username if username else sip_user
+
+    logger.info(
+        "Placing Linphone outbound call: user=%s trunk=%s from=%s",
+        sip_user,
+        sip_hostname,
+        sip_from,
+    )
+
+    try:
+        trunk_config = SIPOutboundConfig(
+            hostname=sip_hostname,
+            auth_username=username,
+            auth_password=password,
+            transport=SIPTransport.SIP_TRANSPORT_UDP,  # Linphone uses UDP
+        )
+        request = CreateSIPParticipantRequest(
+            trunk=trunk_config,
+            sip_number=sip_from,   # caller-id username (no sip: prefix, no @host)
+            sip_call_to=sip_user,  # destination username — LiveKit appends @hostname from trunk
+            room_name=ctx.room.name,
+            participant_identity=sip_address,
+            participant_name="Farmer",
+            wait_until_answered=True,
+            play_dialtone=True,
+            ringing_timeout=Duration(seconds=60),  # give 60s to pick up
+            # Linphone free tier uses plain RTP — disable SRTP to avoid 488
+            media_encryption=SIPMediaEncryption.SIP_MEDIA_ENCRYPT_DISABLE,
+        )
+        await ctx.api.sip.create_sip_participant(request)
+        logger.info("Outbound call answered: %s", sip_address)
+        return sip_address
+
+    except TwirpError as exc:
+        logger.warning(
+            "Outbound call to %s failed: %s (HTTP %s)", sip_address, exc.message, exc.status
+        )
+        msg = exc.message.lower()
+        if "busy" in msg or "decline" in msg or "486" in msg or "603" in msg:
+            logger.info("Call outcome: USER_REJECTED")
+        elif "timeout" in msg or "unavailable" in msg or "408" in msg or "480" in msg:
+            logger.info("Call outcome: NO_ANSWER")
+        elif exc.status >= 500:
+            logger.info("Call outcome: SIP_TRUNK_FAILURE")
+        else:
+            logger.info("Call outcome: CALL_FAILED — %s", exc.message)
+        ctx.shutdown()
+        return None
+
+    except Exception as exc:
+        logger.exception(
+            "Unexpected error placing outbound call to %s: %s", sip_call_to, exc
+        )
+        ctx.shutdown()
+        return None
+
+
+def _build_outbound_opening(topic: str) -> str:
+    """
+    Build the outbound opening statement.
+    Rule: first two sentences must cover WHO is calling, WHY, and how to OPT OUT.
+    """
+    return (
+        "Namaste! Main KrishiMitra AI hoon, ek automated farming assistant. "
+        f"Main aapko aaj ka farming tip dene ke liye call kar rahi hoon — topic hai: {topic}. "
+        "Agar aap yeh call nahi chahte, to bas 'band karo' ya 'stop' bolein "
+        "aur main turant call khatam kar dungi. "
+        "Kya aap tayaar hain?"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent entrypoint
+# ---------------------------------------------------------------------------
+
+
 async def my_agent(ctx: JobContext):
     logger.info("========== JOB RECEIVED ==========")
     print("========== JOB RECEIVED ==========")
@@ -507,46 +633,80 @@ async def my_agent(ctx: JobContext):
         # Initialise the database (creates table if it doesn't exist yet)
         init_db()
 
-        # Logging setup
-        # Add any other context you want in all log entries here
-        ctx.log_context_fields = {
-            "room": ctx.room.name,
-        }
+        ctx.log_context_fields = {"room": ctx.room.name}
 
-        # Join the room and connect to the user FIRST
+        # ---------------------------------------------------------------
+        # Detect outbound call from job metadata
+        # ---------------------------------------------------------------
+        meta = _parse_outbound_metadata(ctx)
+        call_topic: str = meta.get("topic", "aaj ka farming tip")
+        # Outbound mode when linphone_sip_address is present in metadata
+        sip_address: str | None = meta.get("linphone_sip_address") or None
+        is_outbound: bool = bool(sip_address)
+
+        if is_outbound:
+            logger.info("OUTBOUND MODE: sip=%s topic=%s", sip_address, call_topic)
+        else:
+            logger.info("INBOUND/WEB MODE")
+
+        # ---------------------------------------------------------------
+        # Connect to the room first — required before placing SIP calls
+        # ---------------------------------------------------------------
         await ctx.connect()
         print("CONNECTED")
 
-        # Resolve stable user_id from participant identity.
-        # remote_participants may already be populated after connect().
-        # If not, wait briefly for the participant to join.
-        for _ in range(10):
-            if ctx.room.remote_participants:
-                break
-            await asyncio.sleep(0.3)
-        user_id = (
-            next(iter(ctx.room.remote_participants.values())).identity
-            if ctx.room.remote_participants
-            else "voice_assistant_user_dev_1"
-        )
+        # ---------------------------------------------------------------
+        # Place the outbound SIP call (if outbound mode)
+        # ---------------------------------------------------------------
+        if is_outbound:
+            participant_identity = await _place_outbound_call(ctx, meta)
+            if not participant_identity:
+                # Failure already logged and ctx.shutdown() called inside helper
+                return
+
+            # Wait for the SIP participant to fully join the room
+            try:
+                sip_participant = await asyncio.wait_for(
+                    ctx.wait_for_participant(identity=participant_identity),
+                    timeout=30.0,
+                )
+                logger.info(
+                    "SIP participant joined: identity=%s", sip_participant.identity
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Timed out waiting for SIP participant %s to join",
+                    participant_identity,
+                )
+                ctx.shutdown()
+                return
+
+            user_id = participant_identity
+
+        else:
+            # Inbound / web mode — resolve user_id from participant identity
+            for _ in range(10):
+                if ctx.room.remote_participants:
+                    break
+                await asyncio.sleep(0.3)
+            user_id = (
+                next(iter(ctx.room.remote_participants.values())).identity
+                if ctx.room.remote_participants
+                else "voice_assistant_user_dev_1"
+            )
+
         logger.info("user_id resolved to: %s", user_id)
 
-        # Set up a voice AI pipeline using Murf Falcon, Gemini, Deepgram, and the LiveKit turn detector
+        # ---------------------------------------------------------------
+        # Build voice pipeline (same for both inbound and outbound)
+        # ---------------------------------------------------------------
         session = AgentSession(
-            # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-            # See all available models at https://docs.livekit.io/agents/models/stt/
-            # "multi" enables automatic language detection so Hindi/Hinglish is picked up correctly
             stt=deepgram.STT(model="nova-3", language="multi"),
-            # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-            # See all available models at https://docs.livekit.io/agents/models/llm/
             llm=openai.LLM(
                 model="llama-3.3-70b-versatile",
                 api_key=os.environ.get("GROQ_API_KEY"),
                 base_url="https://api.groq.com/openai/v1",
             ),
-            # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-            # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-            # Anisha is an Indian English/Hindi-friendly voice from Murf's voice library
             tts=murf.TTS(
                 voice="en-IN-anisha",
                 locale="en-IN",
@@ -554,85 +714,111 @@ async def my_agent(ctx: JobContext):
                 streaming=False,
                 verbose=True,
             ),
-            # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-            # See more at https://docs.livekit.io/agents/build/turns
             turn_detection=MultilingualModel(),
             vad=ctx.proc.userdata["vad"],
-            # allow the LLM to generate a response while waiting for the end of turn
-            # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
             preemptive_generation=True,
         )
 
-        # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-        # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-        # 1. Install livekit-agents[openai]
-        # 2. Set OPENAI_API_KEY in .env.local
-        # 3. Add `from livekit.plugins import openai` to the top of this file
-        # 4. Use the following session setup instead of the version above
-        # session = AgentSession(
-        #     llm=openai.realtime.RealtimeModel(voice="marin")
-        # )
-
-        # # Add a virtual avatar to the session, if desired
-        # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-        # avatar = hedra.AvatarSession(
-        #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-        # )
-        # # Start the avatar and wait for it to join
-        # await avatar.start(session, room=ctx.room)
-
-        # Look up caller in DB BEFORE starting session.
-        # Greeting is injected by code — not left to LLM tool calling.
-        caller = get_user(user_id)
-        if caller:
-            name = caller.get("name") or "aap"
-            facts = caller.get("facts", {})
-
-            # Build a natural summary of what we know about them
-            known_parts = []
-            crops = facts.get("crops", [])
-            if crops:
-                known_parts.append(f"{', '.join(crops)} ki kheti")
-            district = facts.get("district")
-            if _clean_memory_value(district):
-                known_parts.append(f"{district} district")
-            land_size = facts.get("land_size")
-            if _clean_memory_value(land_size):
-                known_parts.append(f"{land_size} zameen")
-            irrigation = facts.get("irrigation_type")
-            if _clean_memory_value(irrigation):
-                known_parts.append(f"{irrigation} sinchaai")
-
-            if known_parts:
-                context_str = " aur ".join(known_parts)
-                greeting = f"Namaste {name}! Pichli baar aapne {context_str} ke baare mein bataya tha. Aaj kya sawaal hai?"
-            else:
-                greeting = f"Namaste {name}! Aap wapas aaye, achha laga. Aaj main aapki kaise madad kar sakti hoon?"
-
-            logger.info("Returning caller: %s, known facts: %s", user_id, facts)
+        # ---------------------------------------------------------------
+        # Build greeting
+        # ---------------------------------------------------------------
+        if is_outbound:
+            # Outbound: clear identity + purpose + opt-out in first two sentences
+            greeting = _build_outbound_opening(call_topic)
+            logger.info("Outbound opening prepared for sip=%s", sip_address)
         else:
-            greeting = "Namaste! Main KrishiMitra AI hoon. Main kheti, crops, seechaai, mitti ki sehat aur sarkari krishi yojanaon se judi jankari dene ke liye yahan hoon. Aaj main aapki kaise madad kar sakti hoon?"
-            logger.info("New caller: %s", user_id)
+            # Inbound / web: use returning-caller personalisation
+            caller = get_user(user_id)
+            if caller:
+                name = caller.get("name") or "aap"
+                facts = caller.get("facts", {})
+                known_parts = []
+                crops = facts.get("crops", [])
+                if crops:
+                    known_parts.append(f"{', '.join(crops)} ki kheti")
+                district = facts.get("district")
+                if _clean_memory_value(district):
+                    known_parts.append(f"{district} district")
+                land_size = facts.get("land_size")
+                if _clean_memory_value(land_size):
+                    known_parts.append(f"{land_size} zameen")
+                irrigation = facts.get("irrigation_type")
+                if _clean_memory_value(irrigation):
+                    known_parts.append(f"{irrigation} sinchaai")
 
-        async def handle_chat_message(
-            reader: rtc.TextStreamReader, participant_info
-        ) -> None:
-            message = (await reader.read_all()).strip()
-            if not message:
-                return
+                if known_parts:
+                    context_str = " aur ".join(known_parts)
+                    greeting = f"Namaste {name}! Pichli baar aapne {context_str} ke baare mein bataya tha. Aaj kya sawaal hai?"
+                else:
+                    greeting = f"Namaste {name}! Aap wapas aaye, achha laga. Aaj main aapki kaise madad kar sakti hoon?"
+                logger.info("Returning caller: %s, known facts: %s", user_id, facts)
+            else:
+                greeting = "Namaste! Main KrishiMitra AI hoon. Main kheti, crops, seechaai, mitti ki sehat aur sarkari krishi yojanaon se judi jankari dene ke liye yahan hoon. Aaj main aapki kaise madad kar sakti hoon?"
+                logger.info("New caller: %s", user_id)
 
-            logger.info(
-                "chat text received from participant=%s: %r",
-                getattr(participant_info, "identity", "unknown"),
-                message,
-            )
-            await session.interrupt()
-            session.generate_reply(user_input=message, input_modality="text")
+        # ---------------------------------------------------------------
+        # Handle mid-call disconnections (outbound-specific logging)
+        # ---------------------------------------------------------------
+        if is_outbound:
+            _outbound_identity = participant_identity  # captured for the closure
 
-        for topic in CHAT_TOPICS:
-            ctx.room.register_text_stream_handler(topic, handle_chat_message)
+            @ctx.room.on("participant_disconnected")
+            def on_participant_disconnected(participant: rtc.RemoteParticipant):
+                if participant.identity != _outbound_identity:
+                    return
+                reason = participant.disconnect_reason
+                if reason == rtc.DisconnectReason.CLIENT_INITIATED:
+                    logger.info(
+                        "Call outcome: COMPLETED — caller %s hung up after answering",
+                        _outbound_identity,
+                    )
+                elif reason == rtc.DisconnectReason.USER_REJECTED:
+                    logger.info(
+                        "Call outcome: REJECTED — caller %s declined",
+                        _outbound_identity,
+                    )
+                elif reason == rtc.DisconnectReason.USER_UNAVAILABLE:
+                    logger.info(
+                        "Call outcome: UNAVAILABLE — caller %s unreachable",
+                        _outbound_identity,
+                    )
+                elif reason == rtc.DisconnectReason.SIP_TRUNK_FAILURE:
+                    logger.error(
+                        "Call outcome: TRUNK_FAILURE — SIP error for %s",
+                        _outbound_identity,
+                    )
+                else:
+                    logger.info(
+                        "Call outcome: DISCONNECTED (%s) — caller %s",
+                        reason,
+                        _outbound_identity,
+                    )
 
-        # Start the session
+        # ---------------------------------------------------------------
+        # Register chat stream handler (inbound only — phone callers use voice)
+        # ---------------------------------------------------------------
+        if not is_outbound:
+
+            async def handle_chat_message(
+                reader: rtc.TextStreamReader, participant_info
+            ) -> None:
+                message = (await reader.read_all()).strip()
+                if not message:
+                    return
+                logger.info(
+                    "chat text received from participant=%s: %r",
+                    getattr(participant_info, "identity", "unknown"),
+                    message,
+                )
+                await session.interrupt()
+                session.generate_reply(user_input=message, input_modality="text")
+
+            for topic in CHAT_TOPICS:
+                ctx.room.register_text_stream_handler(topic, handle_chat_message)
+
+        # ---------------------------------------------------------------
+        # Start session
+        # ---------------------------------------------------------------
         await session.start(
             agent=Assistant(user_id=user_id),
             room=ctx.room,
@@ -649,7 +835,9 @@ async def my_agent(ctx: JobContext):
         )
         print("SESSION STARTED")
 
-        # Speak greeting immediately — no silence, no waiting for LLM
+        # Speak greeting immediately after session starts.
+        # For outbound: the call is already answered before we reach here, so
+        # the farmer hears the opening the moment we start speaking.
         session.say(greeting, allow_interruptions=True)
 
     except Exception:
