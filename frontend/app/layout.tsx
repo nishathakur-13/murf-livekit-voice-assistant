@@ -82,17 +82,25 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                 🌾 KrishiMitra AI
               </span>
             </a>
-            <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase">
-              Powered by{' '}
+            <div className="flex items-center gap-4">
               <a
-                target="_blank"
-                rel="noopener noreferrer"
-                href="https://murf.ai/api/docs/text-to-speech/streaming"
-                className="underline underline-offset-4"
+                href="/escalations"
+                className="text-foreground/70 hover:text-foreground font-mono text-xs font-bold tracking-wider uppercase transition-colors"
               >
-                Murf Falcon TTS
+                🆘 Escalations
               </a>
-            </span>
+              <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase">
+                Powered by{' '}
+                <a
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  href="https://murf.ai/api/docs/text-to-speech/streaming"
+                  className="underline underline-offset-4"
+                >
+                  Murf Falcon TTS
+                </a>
+              </span>
+            </div>
           </header>
 
           {children}

@@ -54,7 +54,20 @@ export function AgentChatTranscript({
   return (
     <Conversation className={className} {...props}>
       <ConversationContent>
-        {messages.map((receivedMessage) => {
+        {messages
+          .filter(({ message }) => {
+            // Hide raw tool call / function call messages that leak from the agent
+            if (!message) return false;
+            const trimmed = message.trim();
+            if (trimmed.startsWith('function=')) return false;
+            if (trimmed.startsWith('(function=')) return false;
+            if (trimmed.startsWith('<function')) return false;
+            if (trimmed.startsWith('{"function"')) return false;
+            if (trimmed.startsWith('[SYSTEM')) return false;
+            if (/\(function=\w+>/.test(trimmed)) return false;
+            return true;
+          })
+          .map((receivedMessage) => {
           const { id, timestamp, from, message } = receivedMessage;
           const locale = navigator?.language ?? 'en-US';
           const messageOrigin = from?.isLocal ? 'user' : 'assistant';

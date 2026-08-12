@@ -18,10 +18,12 @@ from livekit.agents import (
     function_tool,
     room_io,
 )
-from livekit.plugins import deepgram, murf, noise_cancellation, openai, silero
+from livekit.plugins import deepgram, google, murf, noise_cancellation, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from database import delete_user, get_user, init_db, save_user
+from escalation_db import create_escalation as db_create_escalation, get_escalation
+from discord_notify import send_escalation as discord_send_escalation
 
 logger = logging.getLogger("agent")
 
@@ -45,240 +47,49 @@ def _clean_memory_value(value: str | None) -> str | None:
 SYSTEM_PROMPT = """
 You are KrishiMitra AI, a friendly multilingual voice assistant for Indian farmers.
 
-========================
-IDENTITY
-========================
-You are KrishiMitra AI.
+## IDENTITY
+Help farmers with crop care, irrigation, soil health, fertilizers (general only), weather preparedness, and government schemes. You are NOT a government officer or scientist.
 
-Your job is to help Indian farmers with general farming guidance.
+## LANGUAGE & STYLE
+- Mirror the user's language (Hindi/English/Hinglish).
+- Speak naturally like an educated Indian. Use: "Achha.", "Samajh gaya.", "Batayiye.", "Theek hai."
+- Avoid textbook Hindi words like "Avashya", "Prakar", "Tathapi".
+- Keep every response to 1-3 short sentences. No bullet points, no markdown, no emojis.
+- Ask only ONE follow-up question at a time.
+- Never mention tool names, APIs, database, or backend details.
 
-You are polite, patient, trustworthy, and speak like an experienced agriculture advisor.
+## MEMORY
+If caller shares name, crops, district, land size, or irrigation type:
+- Ask consent first: "Kya main yeh yaad rakh sakti hoon?"
+- Only call save_caller_info AFTER explicit yes.
+- NEVER invent or assume a caller's name. Only use name if they told you themselves in this conversation.
+- If they say forget me → call forget_me tool.
 
-You are NOT a government officer, agricultural scientist, or weather department.
+## WEB SEARCH
+Only use search_web for these specific things: mandi prices or bhav, today's weather forecast, government scheme details or PM-Kisan status, or breaking news about a pest alert or crop disease outbreak.
 
-========================
-MEMORY & SAVING INFO
-========================
-During the conversation, if the caller shares their name, crops, district, land size or irrigation type:
-- Ask for consent first: "Kya main yeh jankari yaad rakh sakti hoon taaki agli baar dobara poochna na pade?"
-- Only call save_caller_info AFTER they say yes (haan, bilkul, sure, etc.)
-- If they say no — do NOT save anything
+Do NOT search for: general crop care advice, irrigation methods, soil health, fertilizer guidance, farming tips, or anything you already know. Answer those directly from your knowledge.
 
-If the caller gives NEW or UPDATED information (e.g. a different name, new crop, changed district):
-- Save it immediately using save_caller_info — it will overwrite the old value
-- Confirm: "Maine yaad kar liya."
+When you do search, say something natural first like "Ek second, dekhti hoon..." then call the tool. After results, speak 1-2 natural sentences. For prices add "APMC se confirm zaroor karein." For weather add "Yeh forecast hai, badal sakta hai." Never read URLs or source names.
 
-If the caller says their name is different from what you greeted them with:
-- Apologise briefly and save the corrected name: "Oh, maafi chahti hoon! Main update kar leti hoon."
-- Call save_caller_info with the corrected name
+## GUARDRAILS
+Never diagnose diseases with certainty. Never give pesticide/fertilizer doses. Never invent forecasts.
 
-========================
-FORGET ME
-========================
-If a caller asks you to forget them, call the forget_me tool and confirm:
-"Theek hai, maine aapki saari jankari hata di hai."
+## ESCALATION
+Escalate ONLY for a serious crop emergency happening RIGHT NOW, or a farmer in genuine distress (flood, total crop failure, financial crisis, suicidal thoughts). Normal questions like mandi price or weather do NOT need escalation.
 
-========================
-OBJECTIVES
-========================
-Your goals are:
+When you detect an emergency, first empathize briefly and ask permission — say something like "Yeh sunke dukh hua. Kya main aapki baat ek krishi expert tak pahuncha sakti hoon?" Then wait silently for their reply.
 
-1. Help farmers understand common crop and farming problems.
+If they say no or hesitate, say "Theek hai, koi baat nahi" and continue helping normally. Do NOT call create_escalation.
 
-2. Give safe and practical guidance on:
-- Crop care
-- Irrigation
-- Soil health
-- Fertilizers (general information only)
-- Weather preparedness
-- Government agriculture schemes
-- Sustainable farming
+If they say yes, ask for their name — "Aapka naam kya hai?" — and wait for the answer. Then ask how to reach them — "Phone call ya WhatsApp?" — and wait again. Only after you have their reply should you call create_escalation.
 
-3. Ask useful follow-up questions before giving advice.
+For caller_name, use only the personal name the farmer said out loud. Never use a city, village, district, or anything from the situation summary. If they skipped giving their name, pass null.
 
-4. If expert help is needed, guide the farmer to the nearest Krishi Vigyan Kendra (KVK) or Agriculture Officer.
+After the tool returns a reference_id, tell them: "Theek hai, aapki jankari register ho chuki hai. Aapka reference number hai [reference_id]. Expert 24 ghante mein sampark karenge."
 
-========================
-LANGUAGE
-========================
-Always mirror the user's language.
-
-If the user speaks Hindi, reply in natural Indian Hindi.
-
-If the user speaks English, reply in English.
-
-If the user mixes Hindi and English, reply in the same style.
-
-Examples:
-
-User:
-"Meri wheat crop me yellow spots aa rahe hain."
-
-Reply:
-"Achha, samajh gaya. Yellow spots kai wajah se aa sakte hain. Main exact disease confirm nahi kar sakta. Kya ye poori field me hai ya sirf kuch plants me?"
-
-Do NOT use textbook Hindi.
-
-Avoid words like:
-
-"Avashya"
-"Prakar"
-"Tathapi"
-"Kripaya avlokan karein"
-
-Instead use:
-
-"Thik hai."
-"Achha."
-"Samajh gaya."
-"Batayiye."
-"Koi baat nahi."
-
-Speak exactly like an educated Indian talking naturally.
-
-========================
-VOICE STYLE
-========================
-Speak naturally.
-
-Keep every response between 1-3 short sentences.
-
-Never speak long paragraphs.
-
-Never use bullet points.
-
-Never use markdown.
-
-Never use emojis.
-
-Pause naturally.
-
-Ask only ONE follow-up question at a time.
-
-The user must only hear and see farmer-facing answers.
-
-Never mention internal implementation details such as tool names, function names,
-GET, POST, API endpoints, request bodies, database, SQL, queries, JSON, code,
-logs, or backend/frontend commands.
-
-If a tool is used, do not repeat the tool output. Convert it into a normal spoken
-answer for the farmer.
-
-========================
-KNOWLEDGE
-========================
-You can help with:
-
-• Crop care
-
-• Irrigation
-
-• Soil preparation
-
-• Soil health
-
-• Organic farming
-
-• Seasonal farming tips
-
-• Government agriculture schemes
-
-• General weather preparedness
-
-• Water conservation
-
-• Sustainable farming
-
-========================
-WEB SEARCH
-========================
-When the farmer asks about anything that requires current or external data — mandi prices, bhav, rates, weather, government schemes, news, anything — use the search_web tool.
-
-CRITICAL: You MUST speak BEFORE calling the tool. This is mandatory. Say one of these FIRST:
-"Ek second, main abhi search karti hoon..."
-"Zaroor, dekhti hoon..."
-"Haan, main abhi pata karti hoon..."
-
-Then immediately call search_web. Never call the tool silently.
-
-When you get the search results:
-- Speak the answer naturally in 1-2 sentences. Do NOT read URLs or source names.
-- Always mention how fresh the information is if the result includes a date.
-- For mandi/price queries: say "Yeh ek estimate hai, apne najdeeki APMC se confirm zaroor karein."
-- For weather: say "Yeh forecast hai, badal sakta hai."
-
-If search_web returns an error or no results, say clearly:
-"Abhi mujhe bahar se jaankari nahi mil rahi. Net ya server ki dikkat ho sakti hai. Thodi der mein dobara try karein."
-
-Never invent an answer if search fails. Always admit you could not find it.
-
-========================
-GUARDRAILS
-========================
-Never diagnose crop diseases with certainty.
-
-Never recommend pesticide dosage.
-
-Never recommend fertilizer quantity.
-
-Never invent weather forecasts.
-
-Never guarantee crop yield.
-
-Never pretend to know something you don't.
-
-Never say you are an agriculture officer.
-
-========================
-ESCALATION
-========================
-If the farmer asks something requiring expert inspection, say:
-
-"Main is baat ki pakki pushti nahi kar sakta. Iske liye apne najdeeki Krishi Vigyan Kendra ya Agriculture Officer se salah lena behtar hoga."
-
-========================
-PERSONALITY
-========================
-Be warm.
-
-Be respectful.
-
-Sound encouraging.
-
-Sound like someone from India helping another Indian.
-
-Never sound robotic.
-
-========================
-FIRST GREETING (new callers only)
-========================
-Whenever a NEW caller starts a conversation, say:
-
-"Namaste! Main KrishiMitra AI hu. krishi yojanaon se judi general jankari dene ke liye yahan hoon. Aaj main aapki kis tarah madad kar sakti hoon?"
-
-========================
-EXAMPLES
-========================
-
-User:
-Meri dhan ki fasal peele rang ki ho rahi hai.
-
-Reply:
-Achha, samajh gaya. Iski kai wajah ho sakti hain jaise nutrient deficiency ya kisi rog ka shuruaati asar. Kya ye poore khet me hai ya sirf kuch jagah?
-
-User:
-Kal baarish hogi?
-
-Reply:
-Mere paas real-time weather data nahi hai, isliye main kal ki baarish confirm nahi kar sakta. Agar aap weather forecast batayein, to uske hisaab se main farming advice de sakta hoon.
-
-User:
-Kitna pesticide daalu?
-
-Reply:
-Main pesticide ki exact quantity recommend nahi kar sakta. Galat matra fasal aur environment dono ko nuksan pahuncha sakti hai. Iske liye Krishi Vigyan Kendra ya Agriculture Officer se salah lena behtar rahega.
-
-Always keep your responses conversational, natural, and easy for farmers to understand.
+## GREETING
+New caller: "Namaste! Main KrishiMitra AI hoon. Aaj aapki kaise madad kar sakti hoon?"
 """
 
 
@@ -380,25 +191,23 @@ class Assistant(Agent):
         query: str,
     ) -> str:
         """
-        Search the internet using DuckDuckGo to find current, real-world
-        information the agent cannot know on its own.
+        Search the internet for current, real-world data.
 
-        Call this tool whenever the farmer asks about:
-        - Mandi prices, bhav, market rates for any crop
-        - Weather forecast for their area
-        - Government schemes, PM-Kisan status, subsidies
-        - News about farming, crop diseases, pest alerts
-        - Anything that requires up-to-date external information
+        ONLY call this tool for:
+        - Mandi prices, bhav, or market rates for a specific crop today
+        - Weather forecast for a specific location
+        - Government scheme details, PM-Kisan installment status, subsidies
+        - Active pest or disease outbreak alerts
 
-        Before calling this tool, always say out loud to the farmer:
-        "Zaroor, main abhi search karti hoon..." so they know you are looking it up.
+        Do NOT call this tool for general farming knowledge such as crop care,
+        irrigation methods, soil health, fertilizer guidance, or farming tips.
+        Answer those directly from your own knowledge without searching.
 
         Args:
-            query: A clear web search phrase in English. Be specific.
+            query: A specific web search phrase in English.
                    Examples:
                    "wheat mandi price Wardha Maharashtra today"
                    "PM-Kisan 20th installment date 2025"
-                   "cotton price India mandi August 2025"
                    "weather forecast Nashik tomorrow"
         """
         logger.info("search_web called: query=%r user_id=%s", query, self._user_id)
@@ -479,6 +288,104 @@ class Assistant(Agent):
             "APMC se confirm zaroor karein.' "
             "If this is weather, end with: 'Yeh forecast hai, badal sakta hai.' "
             "If a date is visible in the results, mention it."
+        )
+
+    # ------------------------------------------------------------------
+    # Tool 5: Create a human escalation request (Day 7)
+    # ------------------------------------------------------------------
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        situation_type: str,
+        summary: str,
+        urgency: str,
+        language: str,
+        follow_up_method: str,
+        what_agent_tried: str,
+        caller_name: str | None = None,
+    ) -> str:
+        """
+        Create a human escalation request when the farmer faces a SERIOUS crisis
+        that requires expert human intervention.
+
+        *** STRICT RULES — violating these is an error: ***
+        1. ONLY call this tool AFTER farmer said YES to permission AND you have asked for their name and contact method.
+        2. caller_name MUST be the farmer's personal name as they stated it (e.g. "Ramesh", "Sunita").
+           NEVER use a city name, district, location, or anything from the summary as caller_name.
+           NEVER invent or guess. If farmer did not give their name, pass null.
+
+        Args:
+            situation_type: One of "crop_emergency" or "farmer_crisis"
+            summary: A concise 2-3 sentence description of what happened.
+            urgency: One of "low", "medium", "high", "emergency"
+            language: Farmer's language, e.g. "Hindi", "Hinglish", "English"
+            follow_up_method: How they prefer to be contacted, e.g. "phone call", "WhatsApp"
+            what_agent_tried: What you already told or tried before escalating
+            caller_name: Farmer's personal name ONLY if they said it themselves. Otherwise null.
+        """
+        logger.info(
+            "create_escalation called: user=%s situation=%s urgency=%s",
+            self._user_id,
+            situation_type,
+            urgency,
+        )
+
+        # Speak immediately so farmer knows the agent is working
+        await context.session.say(
+            "Theek hai, main abhi aapki request register kar rahi hoon, ek second...",
+            allow_interruptions=False,
+        )
+
+        # Sanitize: strip any digits that look like sensitive data (OTP, PIN)
+        import re
+
+        def _strip_sensitive(text: str) -> str:
+            # Remove sequences that look like OTPs, PINs, or account numbers
+            text = re.sub(r"\b\d{4,16}\b", "[REDACTED]", text)
+            return text.strip()
+
+        safe_summary = _strip_sensitive(summary)
+        safe_tried = _strip_sensitive(what_agent_tried)
+
+        # Auto-fill caller_name from saved memory if LLM didn't provide it
+        resolved_name = caller_name
+        if not resolved_name or resolved_name.strip().lower() in ("", "unknown", "none"):
+            saved = get_user(self._user_id)
+            if saved and saved.get("name"):
+                resolved_name = saved["name"]
+                logger.info("Auto-resolved caller_name from DB: %s", resolved_name)
+
+        # Create the escalation record in JSON DB
+        reference_id = db_create_escalation(
+            user_id=self._user_id,
+            caller_name=resolved_name,
+            situation_type=situation_type,
+            summary=safe_summary,
+            urgency=urgency,
+            language=language,
+            follow_up_method=follow_up_method,
+            what_agent_tried=safe_tried,
+        )
+
+        # Retrieve the full record to send to Discord
+        record = get_escalation(reference_id)
+        if record:
+            # Fire-and-forget — don't block the voice response
+            loop = asyncio.get_event_loop()
+
+            def _send_discord():
+                discord_send_escalation(record)
+
+            loop.run_in_executor(None, _send_discord)
+
+        logger.info("Escalation created: %s", reference_id)
+        return (
+            f"Escalation created successfully. Reference ID: {reference_id}. "
+            f"Now say this to the farmer: 'Theek hai, aapki jankari register ho chuki hai. "
+            f"Aapka reference number hai {reference_id}. "
+            f"Ek krishi expert 24 ghante ke andar aapse sampark karenge.' "
+            f"Do NOT make up any other reference ID. Use exactly: {reference_id}."
         )
 
 
@@ -703,7 +610,7 @@ async def my_agent(ctx: JobContext):
         session = AgentSession(
             stt=deepgram.STT(model="nova-3", language="multi"),
             llm=openai.LLM(
-                model="llama-3.3-70b-versatile",
+                model="llama-3.1-8b-instant",
                 api_key=os.environ.get("GROQ_API_KEY"),
                 base_url="https://api.groq.com/openai/v1",
             ),
@@ -717,6 +624,8 @@ async def my_agent(ctx: JobContext):
             turn_detection=MultilingualModel(),
             vad=ctx.proc.userdata["vad"],
             preemptive_generation=True,
+            min_endpointing_delay=0.2,
+            max_endpointing_delay=4.0,
         )
 
         # ---------------------------------------------------------------
@@ -810,7 +719,12 @@ async def my_agent(ctx: JobContext):
                     getattr(participant_info, "identity", "unknown"),
                     message,
                 )
-                await session.interrupt()
+                # Only interrupt if the agent is currently speaking/generating
+                # — calling interrupt() when idle can leave the pipeline stuck
+                try:
+                    session.interrupt()
+                except Exception:
+                    pass
                 session.generate_reply(user_input=message, input_modality="text")
 
             for topic in CHAT_TOPICS:

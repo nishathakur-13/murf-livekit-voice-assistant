@@ -4,7 +4,7 @@ import { type ComponentProps, useEffect, useRef, useState } from 'react';
 import { Track } from 'livekit-client';
 import { Loader, MessageSquareTextIcon, SendHorizontal } from 'lucide-react';
 import { type MotionProps, motion } from 'motion/react';
-import { useChat } from '@livekit/components-react';
+import { useChat, useLocalParticipant } from '@livekit/components-react';
 import { AgentDisconnectButton } from '@/components/agents-ui/agent-disconnect-button';
 import { AgentTrackControl } from '@/components/agents-ui/agent-track-control';
 import {
@@ -252,6 +252,7 @@ export function AgentControlBar({
   ...props
 }: AgentControlBarProps & ComponentProps<'div'>) {
   const { send } = useChat();
+  const { localParticipant } = useLocalParticipant();
   const publishPermissions = usePublishPermissions();
   const [isChatOpenUncontrolled, setIsChatOpenUncontrolled] = useState(isChatOpen);
   const {
@@ -266,7 +267,20 @@ export function AgentControlBar({
   } = useInputControls({ onDeviceError, saveUserChoices });
 
   const handleSendMessage = async (message: string) => {
-    await send(message);
+    // Use LiveKit text streams (topic: "lk.chat") — this is what the backend
+    // agent listens for via register_text_stream_handler("lk.chat", ...).
+    // Falls back to the legacy useChat data channel if sendText is unavailable.
+    try {
+      if (localParticipant && typeof localParticipant.sendText === 'function') {
+        await localParticipant.sendText(message, { topic: 'lk.chat' });
+      } else {
+        await send(message);
+      }
+    } catch (err) {
+      console.error('Failed to send chat message:', err);
+      // fallback to legacy data channel
+      await send(message);
+    }
   };
 
   const visibleControls = {
