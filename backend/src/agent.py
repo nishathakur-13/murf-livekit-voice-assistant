@@ -24,6 +24,12 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from database import delete_user, get_user, init_db, save_user
 from escalation_db import create_escalation as db_create_escalation, get_escalation
 from discord_notify import send_escalation as discord_send_escalation
+from analytics_db import (
+    init_analytics,
+    record_call_start,
+    record_call_end,
+    mark_call_escalated,
+)
 
 logger = logging.getLogger("agent")
 
@@ -65,12 +71,28 @@ If caller shares name, crops, district, land size, or irrigation type:
 - NEVER invent or assume a caller's name. Only use name if they told you themselves in this conversation.
 - If they say forget me → call forget_me tool.
 
-## WEB SEARCH
-Only use search_web for these specific things: mandi prices or bhav, today's weather forecast, government scheme details or PM-Kisan status, or breaking news about a pest alert or crop disease outbreak.
+## WEB SEARCH — STRICT RULES
 
-Do NOT search for: general crop care advice, irrigation methods, soil health, fertilizer guidance, farming tips, or anything you already know. Answer those directly from your knowledge.
+You have a search_web tool. USE IT VERY RARELY. Default answer is always from your own knowledge.
 
-When you do search, say something natural first like "Ek second, dekhti hoon..." then call the tool. After results, speak 1-2 natural sentences. For prices add "APMC se confirm zaroor karein." For weather add "Yeh forecast hai, badal sakta hai." Never read URLs or source names.
+ONLY call search_web when the user explicitly asks for ONE of these 4 things:
+1. "aaj ka bhav" / mandi price for a specific crop right now
+2. Weather forecast for a specific city/village today or tomorrow
+3. PM-Kisan installment date or a specific government scheme benefit amount
+4. An active pest or disease outbreak alert in a specific region
+
+NEVER call search_web for:
+- How to grow a crop, crop care, sowing time, harvesting — answer from your knowledge
+- Irrigation methods, drip vs flood, borewell — answer from your knowledge
+- Soil health, fertilizer types, NPK — answer from your knowledge
+- General farming tips of any kind — answer from your knowledge
+- Any question where you already know the answer — answer from your knowledge
+
+If the user asks "gehu ki kheti kaise karen" → answer directly, DO NOT search.
+If the user asks "kaunsi khad daalen" → answer directly, DO NOT search.
+If the user asks "aaj gehu ka bhav kya hai Wardha mein" → then you may search.
+
+When you do search, say "Ek second..." first. Speak result in 1-2 sentences only. Never read URLs.
 
 ## GUARDRAILS
 Never diagnose diseases with certainty. Never give pesticide/fertilizer doses. Never invent forecasts.
@@ -191,24 +213,24 @@ class Assistant(Agent):
         query: str,
     ) -> str:
         """
-        Search the internet for current, real-world data.
+        Search the internet. CALL THIS TOOL VERY RARELY.
 
-        ONLY call this tool for:
-        - Mandi prices, bhav, or market rates for a specific crop today
-        - Weather forecast for a specific location
-        - Government scheme details, PM-Kisan installment status, subsidies
-        - Active pest or disease outbreak alerts
+        ALLOWED — only these 4 cases:
+        1. Mandi/bhav: user asks today's market price for a specific crop
+        2. Weather: user asks today's or tomorrow's forecast for a specific place
+        3. Govt scheme: user asks PM-Kisan installment date or a specific scheme benefit
+        4. Outbreak alert: user asks about an active pest or disease in a region
 
-        Do NOT call this tool for general farming knowledge such as crop care,
-        irrigation methods, soil health, fertilizer guidance, or farming tips.
-        Answer those directly from your own knowledge without searching.
+        FORBIDDEN — never call this for:
+        - Crop care, how to grow crops, sowing/harvesting advice → answer from knowledge
+        - Irrigation, soil health, fertilizers, NPK, farming tips → answer from knowledge
+        - Any general agriculture question → answer from knowledge
+        - Anything you already know → answer from knowledge
+
+        If in doubt, answer directly without calling this tool.
 
         Args:
-            query: A specific web search phrase in English.
-                   Examples:
-                   "wheat mandi price Wardha Maharashtra today"
-                   "PM-Kisan 20th installment date 2025"
-                   "weather forecast Nashik tomorrow"
+            query: Specific English search phrase, e.g. "wheat mandi price Wardha today"
         """
         logger.info("search_web called: query=%r user_id=%s", query, self._user_id)
 
@@ -539,6 +561,7 @@ async def my_agent(ctx: JobContext):
 
         # Initialise the database (creates table if it doesn't exist yet)
         init_db()
+        init_analytics()
 
         ctx.log_context_fields = {"room": ctx.room.name}
 
@@ -603,6 +626,19 @@ async def my_agent(ctx: JobContext):
             )
 
         logger.info("user_id resolved to: %s", user_id)
+
+        # ---------------------------------------------------------------
+        # Record call start in analytics
+        # ---------------------------------------------------------------
+        session_id = ctx.room.name
+        channel = "sip" if is_outbound else "web"
+        record_call_start(session_id, user_id, channel=channel)
+        logger.info("Analytics: call started session=%s channel=%s", session_id, channel)
+
+        # Track per-session state for outcome detection
+        _call_had_response = False   # True once the agent has spoken at least once
+        _call_escalated    = False   # True if create_escalation was called this session
+        _call_language     = None    # Will be updated from LLM response metadata
 
         # ---------------------------------------------------------------
         # Build voice pipeline (same for both inbound and outbound)
@@ -733,8 +769,9 @@ async def my_agent(ctx: JobContext):
         # ---------------------------------------------------------------
         # Start session
         # ---------------------------------------------------------------
+        agent_instance = Assistant(user_id=user_id)
         await session.start(
-            agent=Assistant(user_id=user_id),
+            agent=agent_instance,
             room=ctx.room,
             room_options=room_io.RoomOptions(
                 audio_input=room_io.AudioInputOptions(
@@ -749,6 +786,113 @@ async def my_agent(ctx: JobContext):
         )
         print("SESSION STARTED")
 
+        # ---------------------------------------------------------------
+        # Analytics: track agent speech to know if farmer got a response
+        # ---------------------------------------------------------------
+        @session.on("agent_state_changed")
+        def _on_agent_state(ev=None):
+            nonlocal _call_had_response
+            # Agent entered "speaking" state = farmer is receiving a response
+            new_state = getattr(ev, "new_state", None)
+            if new_state == "speaking":
+                _call_had_response = True
+
+        # ---------------------------------------------------------------
+        # Analytics: detect when a participant disconnects / room closes
+        # ---------------------------------------------------------------
+        @ctx.room.on("participant_disconnected")
+        def _on_participant_disconnected(participant: rtc.RemoteParticipant):
+            # Only record the outcome when the farmer (not the agent) leaves
+            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+                return
+
+            nonlocal _call_escalated, _call_had_response, _call_language
+
+            # Determine language from saved user profile
+            try:
+                saved = get_user(user_id)
+                if saved and saved.get("language_preference"):
+                    _call_language = saved["language_preference"]
+            except Exception:
+                pass
+
+            # Determine outcome:
+            # success  — agent spoke at least once (farmer got a response), or was escalated
+            # failed   — farmer dropped before agent could respond
+            if _call_escalated:
+                # Escalation always counts as success (farmer got expert help)
+                record_call_end(
+                    session_id,
+                    outcome="success",
+                    language=_call_language,
+                    escalated=True,
+                    notes="Farmer escalated to human expert",
+                )
+                mark_call_escalated(session_id)
+            elif _call_had_response:
+                # Agent responded — call was at minimum partially helpful
+                record_call_end(
+                    session_id,
+                    outcome="success",
+                    language=_call_language,
+                    notes="Farmer received agent response",
+                )
+            else:
+                # Agent never spoke — farmer disconnected before getting any help
+                record_call_end(
+                    session_id,
+                    outcome="failed",
+                    failure_type="user_hangup",
+                    language=_call_language,
+                    notes="Farmer disconnected before agent responded (early disconnect)",
+                )
+
+        @ctx.room.on("disconnected")
+        def _on_room_disconnected(_reason=None):
+            """Fallback: record outcome if room closes without participant_disconnected."""
+            try:
+                conn_check = __import__("sqlite3").connect(
+                    __import__("os").path.join(
+                        __import__("os").path.dirname(__file__),
+                        "krishimitra_memory.db",
+                    ),
+                    check_same_thread=False,
+                )
+                conn_check.row_factory = __import__("sqlite3").Row
+                existing = conn_check.execute(
+                    "SELECT outcome FROM call_analytics WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                conn_check.close()
+                # Only update if still in_progress (not already closed by participant_disconnected)
+                if existing and existing["outcome"] == "in_progress":
+                    record_call_end(
+                        session_id,
+                        outcome="success" if _call_had_response else "failed",
+                        failure_type=None if _call_had_response else "incomplete_task",
+                        language=_call_language,
+                        notes="Room closed",
+                    )
+            except Exception as exc:
+                logger.warning("Analytics fallback error on room disconnect: %s", exc)
+
+        # ---------------------------------------------------------------
+        # Analytics: track escalation tool calls
+        # ---------------------------------------------------------------
+        # We patch create_escalation at the agent level by wrapping ctx shutdown
+        # The simpler approach: mark escalated when the LLM calls the tool.
+        # We detect this via the agent's tool usage through the session event.
+        @session.on("tool_calls_collected")
+        def _on_tool_calls(tool_calls=None, *_args, **_kwargs):
+            nonlocal _call_escalated
+            if not tool_calls:
+                return
+            for tc in (tool_calls if hasattr(tool_calls, "__iter__") else []):
+                name = getattr(tc, "name", "") or getattr(getattr(tc, "function", None), "name", "")
+                if name == "create_escalation":
+                    _call_escalated = True
+                    logger.info("Analytics: escalation detected for session=%s", session_id)
+
         # Speak greeting immediately after session starts.
         # For outbound: the call is already answered before we reach here, so
         # the farmer hears the opening the moment we start speaking.
@@ -758,6 +902,18 @@ async def my_agent(ctx: JobContext):
         import traceback
 
         traceback.print_exc()
+        # Record call as failed due to API/agent error if session_id was set
+        try:
+            _sid = locals().get("session_id")
+            if _sid:
+                record_call_end(
+                    _sid,
+                    outcome="failed",
+                    failure_type="api_error",
+                    notes="Agent exception during call",
+                )
+        except Exception:
+            pass
         raise
 
 

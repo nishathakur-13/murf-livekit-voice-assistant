@@ -89,6 +89,12 @@ export default async function RootLayout({ children }: RootLayoutProps) {
               >
                 🆘 Escalations
               </a>
+              <a
+                href="/analytics"
+                className="text-foreground/70 hover:text-foreground font-mono text-xs font-bold tracking-wider uppercase transition-colors"
+              >
+                📊 Analytics
+              </a>
               <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase">
                 Powered by{' '}
                 <a

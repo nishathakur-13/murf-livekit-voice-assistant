@@ -1,18 +1,1 @@
-{
-  "escalations": [
-    {
-      "reference_id": "ESC-5C4E1A",
-      "user_id": "voice_assistant_user_dev_1",
-      "caller_name": "Nisha",
-      "situation_type": "farmer_crisis",
-      "summary": "kheta mei aagy lagi huai hai",
-      "urgency": "emergency",
-      "language": "Hindi",
-      "follow_up_method": "phone call",
-      "what_agent_tried": "nothing yet",
-      "status": "open",
-      "created_at": "2026-08-12T16:46:32.794553Z",
-      "updated_at": "2026-08-12T16:46:32.794565Z"
-    }
-  ]
-}
+{"escalations": []}
