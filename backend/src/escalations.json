@@ -1,1 +1,18 @@
-{"escalations": []}
+{
+  "escalations": [
+    {
+      "reference_id": "ESC-794631",
+      "user_id": "voice_assistant_user_dev_1",
+      "caller_name": "null",
+      "situation_type": "farmer_crisis",
+      "summary": "kheti ki puri fasal bar bad hui",
+      "urgency": "emergency",
+      "language": "hindi",
+      "follow_up_method": "whatsapp",
+      "what_agent_tried": "normal question answer",
+      "status": "open",
+      "created_at": "2026-08-15T13:42:56.564176Z",
+      "updated_at": "2026-08-15T13:42:56.564200Z"
+    }
+  ]
+}

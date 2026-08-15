@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re as _re
 from concurrent.futures import ThreadPoolExecutor
 
 from ddgs import DDGS
@@ -33,10 +34,148 @@ from analytics_db import (
 
 logger = logging.getLogger("agent")
 
+# Tool names that should never appear in spoken TTS output
+_TOOL_NAME_PATTERN = _re.compile(
+    r"^(transfer_to_crop_specialist|search_web|create_escalation|save_caller_info|forget_me)\b",
+)
+_SPEAKER_PREFIX_PATTERN = _re.compile(r"^\s*(Anisha|Arjun)\s*[-:]\s*", _re.I)
+
+
+async def _filter_tool_leakage(text):
+    """
+    Async generator that strips leaked tool-call artifacts from the LLM text stream
+    before it reaches TTS.
+
+    Filters out chunks/lines that look like:
+      - A tool name (e.g. "transfer_to_crop_specialist")
+      - Raw JSON (starts with { or [)
+      - Inline JSON fragments embedded in a line
+    """
+    buffer = ""
+    async for chunk in text:
+        buffer += chunk
+        # Process complete lines; hold back the last partial line
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            cleaned = _clean_tts_line(line)
+            if cleaned:
+                yield cleaned + "\n"
+    # Flush the remaining buffer
+    if buffer:
+        cleaned = _clean_tts_line(buffer)
+        if cleaned:
+            yield cleaned
+
+
+def _clean_tts_line(line: str) -> str:
+    """
+    Return the line with tool-call artifacts removed, or empty string if the
+    whole line should be suppressed.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return line  # preserve blank lines/whitespace
+
+    tool_check = _SPEAKER_PREFIX_PATTERN.sub("", stripped).strip()
+
+    # Suppress lines that are pure JSON objects or arrays
+    if tool_check.startswith(("{", "[")):
+        return ""
+
+    # Suppress lines that start with a known tool name
+    if _TOOL_NAME_PATTERN.match(tool_check):
+        return ""
+
+    # Strip inline JSON fragments (e.g. '{"symptom_summary": "..."}') from the end of a line
+    cleaned = _re.sub(r'\s*\{[^}]*\}\s*$', "", line).rstrip()
+    return cleaned
+
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env.local"), override=True)
 
 CHAT_TOPICS = ("lk.chat", "lk-chat-topic")
 EMPTY_MEMORY_VALUES = {"", "none", "null", "undefined", "unknown", "n/a", "na"}
+
+SYMPTOM_KEYWORDS = [
+    # yellowing / color changes
+    "peele",
+    "peel",
+    "yellow",
+    "pila",
+    "pile",
+    "पीले",
+    "पीला",
+    "पीली",
+    "पीलेपन",
+    # spots / marks
+    "dhabbe",
+    "dhabb",
+    "daag",
+    "spot",
+    "spots",
+    "धब्बे",
+    "दाग",
+    # mold / powder
+    "safed",
+    "kaala",
+    "black",
+    "white",
+    "powder",
+    "mold",
+    "mildew",
+    "सफेद",
+    "काला",
+    "पाउडर",
+    "फफूंदी",
+    # wilting / dying
+    "mur",
+    "sukh",
+    "wilt",
+    "dying",
+    "mar",
+    "मुरझ",
+    "सूख",
+    "मर",
+    # insects / holes
+    "kide",
+    "kida",
+    "insect",
+    "pest",
+    "hole",
+    "holes",
+    "कीड़े",
+    "कीड़ा",
+    "कीड़ा",
+    "कीट",
+    "छेद",
+    # rot
+    "gal",
+    "rot",
+    "गल",
+    "सड़",
+    # leaf / stem / fruit symptoms
+    "patte",
+    "patta",
+    "leaf",
+    "leaves",
+    "stem",
+    "fruit",
+    "पत्ते",
+    "पत्ता",
+    "पत्ती",
+    "तना",
+    "फल",
+    # blight / disease
+    "blight",
+    "rust",
+    "lesion",
+    "रोग",
+]
+
+
+def _has_crop_symptoms(text: str) -> bool:
+    text_lower = text.lower()
+    return any(keyword in text_lower for keyword in SYMPTOM_KEYWORDS)
 
 
 def _clean_memory_value(value: str | None) -> str | None:
@@ -92,7 +231,7 @@ If the user asks "gehu ki kheti kaise karen" → answer directly, DO NOT search.
 If the user asks "kaunsi khad daalen" → answer directly, DO NOT search.
 If the user asks "aaj gehu ka bhav kya hai Wardha mein" → then you may search.
 
-When you do search, say "Ek second..." first. Speak result in 1-2 sentences only. Never read URLs.
+When you do search, call search_web silently — do NOT say anything before calling the tool. After the tool returns, speak the result in 1-2 sentences only. Never read URLs.
 
 ## GUARDRAILS
 Never diagnose diseases with certainty. Never give pesticide/fertilizer doses. Never invent forecasts.
@@ -110,15 +249,205 @@ For caller_name, use only the personal name the farmer said out loud. Never use 
 
 After the tool returns a reference_id, tell them: "Theek hai, aapki jankari register ho chuki hai. Aapka reference number hai [reference_id]. Expert 24 ghante mein sampark karenge."
 
+## CROP DISEASE / PEST SPECIALIST HANDOFF
+You have access to a Fasal Visheshagya (Crop Disease Specialist) named Arjun.
+Call transfer_to_crop_specialist ONLY when the farmer describes VISIBLE SYMPTOMS on a crop — for example:
+- Yellowing, browning, or spotted leaves
+- White powder or black mold on leaves/stems
+- Insects, larvae, or holes on the plant
+- Wilting, rotting, or dying plants
+- Unusual growth patterns that suggest infection or pest attack
+
+DO NOT transfer for:
+- General crop care questions (sowing time, irrigation, harvesting) — answer yourself
+- Fertilizer and soil questions — answer yourself
+- Mandi price, weather, government schemes — answer yourself (or use search_web)
+- Any question you can answer from your own knowledge
+
+When you detect visible crop symptoms, call transfer_to_crop_specialist IMMEDIATELY and SILENTLY.
+Do NOT ask the farmer for permission. Do NOT say "Kya main Arjun se jodun?" or anything similar.
+The tool itself will announce the handoff. Just call the tool.
+
+CRITICAL — TOOL CALL RULES (follow exactly, no exceptions):
+- When calling ANY tool, output ZERO text before or alongside the tool call.
+- Do NOT say "Ek second", "Wait", "Please hold", "transfer_to_crop_specialist", or ANY words.
+- Do NOT narrate, describe, or repeat the tool name or its arguments.
+- Do NOT output the JSON arguments of a tool call as speech.
+- Simply call the tool silently. The tool itself speaks to the farmer.
+- If you output text at the same time as a tool call, you are making an error.
+
 ## GREETING
 New caller: "Namaste! Main KrishiMitra AI hoon. Aaj aapki kaise madad kar sakti hoon?"
 """
+
+# -------------------------------------------------------------------------
+# Crop Disease Specialist — a focused specialist agent for Day 9 handoff
+# -------------------------------------------------------------------------
+CROP_SPECIALIST_PROMPT = """
+You are Arjun, a Fasal Visheshagya (Crop Disease and Pest Specialist) at KrishiMitra AI.
+
+## YOUR JOB
+You have ONE focused job: help farmers identify crop diseases and pest infestations, and give practical first-response advice.
+
+## WHAT YOU HANDLE
+- Identifying diseases from visible symptoms (yellowing, spots, mold, wilting, rot, blight)
+- Identifying pest damage (insect holes, larvae, webbing, stem boring)
+- Recommending whether to use neem-based or other bio-pesticides (mention type, NOT exact doses)
+- Advising on immediate containment steps (remove infected leaves, isolate plants, improve drainage)
+- Telling the farmer whether to consult a local Krishi Vigyan Kendra for confirmation
+
+## WHAT YOU DO NOT HANDLE
+- Mandi prices, weather, government schemes → tell the farmer to ask KrishiMitra main assistant
+- Sowing time, irrigation, fertilizer dosage → outside your scope
+- Financial crisis, flood, severe distress → outside your scope
+
+## LANGUAGE & STYLE
+- Mirror the farmer's language (Hindi/English/Hinglish).
+- Be direct and practical, like a knowledgeable elder brother who knows farming.
+- Keep every answer to 1-4 sentences. No bullet points, no markdown, no emojis.
+- Ask one focused question at a time to narrow down the diagnosis.
+- Use: "Samjha.", "Dekho,", "Achha,", "Yeh ho sakta hai..."
+- NEVER give exact chemical doses. Say "thoda" or recommend visiting a dealer.
+- If unsure, say: "Bilkul pakka kehna mushkil hai bina dekhe, lekin..." and give the most likely answer.
+
+## DIAGNOSIS APPROACH
+1. First confirm which crop and which part is affected (leaf, stem, root, fruit).
+2. Ask about the symptom color, pattern, and when it started.
+3. Give 1-2 most likely diagnoses with brief explanation.
+4. Give one practical first step the farmer can take TODAY.
+5. If serious, recommend: "Apne najdeeki Krishi Vigyan Kendra se ek baar zaroor dikhayein."
+
+## GUARDRAILS
+- Never guarantee a diagnosis. Always say it is likely, not certain.
+- Never recommend specific pesticide brand names.
+- Never invent statistics or research numbers.
+"""
+
+
+# -------------------------------------------------------------------------
+# Day 9 — Crop Disease Specialist Agent
+# -------------------------------------------------------------------------
+
+
+class CropSpecialist(Agent):
+    """Focused specialist for crop disease and pest identification."""
+
+    def __init__(self, chat_ctx=None) -> None:
+        super().__init__(
+            instructions=CROP_SPECIALIST_PROMPT,
+            chat_ctx=chat_ctx,
+            tts=murf.TTS(
+                voice="en-IN-samar",
+                locale="en-IN",
+                style="Conversation",
+                streaming=False,
+                verbose=True,
+            ),
+        )
+
+    async def on_enter(self) -> None:
+        """Rename the agent to Arjun in the room and greet the farmer."""
+        try:
+            await self.session.room.local_participant.set_name("Arjun")
+            await self.session.room.local_participant.set_attributes({"speaker": "Arjun"})
+            # Send an explicit data message so the frontend knows Arjun has taken over.
+            # This is more reliable than relying on set_name propagation timing.
+            await self.session.room.local_participant.publish_data(
+                b'{"type":"speaker_change","name":"Arjun"}',
+                reliable=True,
+                topic="speaker",
+            )
+        except Exception as e:
+            logger.warning("on_enter setup error: %s", e)
+
+        await self.session.say(
+            "Namaste! Main Arjun hoon, Fasal Visheshagya. "
+            "Aap mujhe batayein — kaunsi fasal hai aur kya lakshan dikh rahe hain?",
+            allow_interruptions=False,
+        )
+
+    async def transcription_node(self, text, model_settings):
+        """Prepend 'Arjun - ' to every message in the transcript so the
+        frontend chat always shows the correct speaker name."""
+        prefix_sent = False
+
+        async def _prefixed():
+            nonlocal prefix_sent
+            async for chunk in text:
+                if not prefix_sent:
+                    yield "Arjun - " + chunk
+                    prefix_sent = True
+                else:
+                    yield chunk
+
+        return Agent.default.transcription_node(self, _prefixed(), model_settings)
+
+    def tts_node(self, text, model_settings):
+        """Override to strip any leaked tool-call text before it reaches TTS."""
+        return Agent.default.tts_node(self, _filter_tool_leakage(text), model_settings)
 
 
 class Assistant(Agent):
     def __init__(self, user_id: str) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
         self._user_id = user_id
+
+    async def on_user_turn_completed(
+        self, turn_ctx, new_message
+    ) -> None:
+        """
+        Before sending to LLM: if the user's message contains visible crop symptom keywords,
+        force tool_choice so the LLM MUST call transfer_to_crop_specialist immediately
+        instead of asking permission or generating any text first.
+        """
+        text = ""
+        try:
+            if hasattr(new_message, "content"):
+                for part in new_message.content:
+                    if isinstance(part, str):
+                        text += part
+                    elif hasattr(part, "text"):
+                        text += part.text
+        except Exception:
+            pass
+
+        if _has_crop_symptoms(text):
+            logger.info(
+                "Symptom keywords detected in user turn — injecting tool_choice=required hint. user=%s text=%r",
+                self._user_id,
+                text[:120],
+            )
+            # Append a system reminder so even a weak LLM knows what to do
+            try:
+                turn_ctx.append(
+                    role="system",
+                    text=(
+                        "SYSTEM OVERRIDE: The farmer just described visible crop symptoms. "
+                        "You MUST call transfer_to_crop_specialist RIGHT NOW. "
+                        "Do NOT output any text. Do NOT ask permission. Just call the tool."
+                    ),
+                )
+            except Exception as e:
+                logger.warning("Could not inject system override: %s", e)
+
+    def tts_node(self, text, model_settings):
+        """Override to strip any leaked tool-call text before it reaches TTS."""
+        return Agent.default.tts_node(self, _filter_tool_leakage(text), model_settings)
+
+    async def transcription_node(self, text, model_settings):
+        """Prepend 'Anisha - ' to every transcript message for the frontend chat."""
+        prefix_sent = False
+
+        async def _prefixed():
+            nonlocal prefix_sent
+            async for chunk in text:
+                if not prefix_sent:
+                    yield "Anisha - " + chunk
+                    prefix_sent = True
+                else:
+                    yield chunk
+
+        return Agent.default.transcription_node(self, _prefixed(), model_settings)
 
     # ------------------------------------------------------------------
     # Tool 1: Look up caller at the start of every call
@@ -204,6 +533,52 @@ class Assistant(Agent):
         return "No saved memory existed for this caller. Still confirm this in simple words."
 
     # ------------------------------------------------------------------
+    # Tool: Handoff to Crop Disease Specialist (Day 9)
+    # ------------------------------------------------------------------
+    @function_tool
+    async def transfer_to_crop_specialist(
+        self,
+        context: RunContext,
+        symptom_summary: str,
+    ) -> tuple:
+        """
+        Transfer the farmer to Arjun, the Fasal Visheshagya (Crop Disease and Pest Specialist).
+
+        CALL THIS TOOL ONLY when the farmer describes VISIBLE SYMPTOMS on a crop:
+        - Yellowing, browning, or spotted leaves
+        - White powder, black mold, or rust on leaves or stems
+        - Insects, larvae, holes, or webbing on the plant
+        - Wilting, stem rot, root rot, or dying plants
+        - Unusual lesions, blights, or discolouration suggesting disease or pest attack
+
+        DO NOT call this tool for:
+        - General crop care, sowing, or irrigation questions
+        - Fertilizer or soil health questions
+        - Mandi prices, weather, or government schemes
+        - Any question you can answer yourself from knowledge
+
+        Args:
+            symptom_summary: A brief description of the crop symptoms the farmer described
+                             (e.g. "tamatar ke patte peele pad rahe hain, kale dhabbe hain").
+        """
+        logger.info(
+            "Handoff to CropSpecialist: user=%s symptoms=%r",
+            self._user_id,
+            symptom_summary,
+        )
+        # Announce the handoff to the farmer before switching agents
+        await self.session.say(
+            "Aapki fasal mein jo lakshan hain, uske liye main aapko hamare Fasal Visheshagya Arjun se jodti hoon.",
+            allow_interruptions=False,
+        )
+        # Pass conversation history (without main-agent instructions) so the
+        # specialist immediately understands what the farmer described.
+        specialist = CropSpecialist(
+            chat_ctx=self.chat_ctx.copy(exclude_instructions=True)
+        )
+        return specialist, "Connecting you to our Crop Disease Specialist Arjun."
+
+    # ------------------------------------------------------------------
     # Tool 4: Web search via DuckDuckGo (free, no API key needed)
     # ------------------------------------------------------------------
     @function_tool
@@ -233,6 +608,9 @@ class Assistant(Agent):
             query: Specific English search phrase, e.g. "wheat mandi price Wardha today"
         """
         logger.info("search_web called: query=%r user_id=%s", query, self._user_id)
+
+        # Acknowledge the search so the farmer doesn't hear silence
+        await self.session.say("Ek second...", allow_interruptions=False)
 
         # --- Auto-enrich query with saved district if it's location-relevant ---
         if any(
@@ -372,7 +750,11 @@ class Assistant(Agent):
 
         # Auto-fill caller_name from saved memory if LLM didn't provide it
         resolved_name = caller_name
-        if not resolved_name or resolved_name.strip().lower() in ("", "unknown", "none"):
+        if not resolved_name or resolved_name.strip().lower() in (
+            "",
+            "unknown",
+            "none",
+        ):
             saved = get_user(self._user_id)
             if saved and saved.get("name"):
                 resolved_name = saved["name"]
@@ -460,7 +842,9 @@ async def _place_outbound_call(ctx: JobContext, meta: dict) -> str | None:
         return None
 
     # hostname is the domain part (e.g. sip.linphone.org)
-    sip_hostname = sip_address.split("@")[-1] if "@" in sip_address else "sip.linphone.org"
+    sip_hostname = (
+        sip_address.split("@")[-1] if "@" in sip_address else "sip.linphone.org"
+    )
     # user part only — LiveKit builds the full INVITE as sip:<sip_user>@<trunk hostname>
     sip_user = sip_address.split("@")[0] if "@" in sip_address else sip_address
     # sip_number = caller-id (From header) — must also be just the username, not a full URI
@@ -482,7 +866,7 @@ async def _place_outbound_call(ctx: JobContext, meta: dict) -> str | None:
         )
         request = CreateSIPParticipantRequest(
             trunk=trunk_config,
-            sip_number=sip_from,   # caller-id username (no sip: prefix, no @host)
+            sip_number=sip_from,  # caller-id username (no sip: prefix, no @host)
             sip_call_to=sip_user,  # destination username — LiveKit appends @hostname from trunk
             room_name=ctx.room.name,
             participant_identity=sip_address,
@@ -499,7 +883,10 @@ async def _place_outbound_call(ctx: JobContext, meta: dict) -> str | None:
 
     except TwirpError as exc:
         logger.warning(
-            "Outbound call to %s failed: %s (HTTP %s)", sip_address, exc.message, exc.status
+            "Outbound call to %s failed: %s (HTTP %s)",
+            sip_address,
+            exc.message,
+            exc.status,
         )
         msg = exc.message.lower()
         if "busy" in msg or "decline" in msg or "486" in msg or "603" in msg:
@@ -633,12 +1020,14 @@ async def my_agent(ctx: JobContext):
         session_id = ctx.room.name
         channel = "sip" if is_outbound else "web"
         record_call_start(session_id, user_id, channel=channel)
-        logger.info("Analytics: call started session=%s channel=%s", session_id, channel)
+        logger.info(
+            "Analytics: call started session=%s channel=%s", session_id, channel
+        )
 
         # Track per-session state for outcome detection
-        _call_had_response = False   # True once the agent has spoken at least once
-        _call_escalated    = False   # True if create_escalation was called this session
-        _call_language     = None    # Will be updated from LLM response metadata
+        _call_had_response = False  # True once the agent has spoken at least once
+        _call_escalated = False  # True if create_escalation was called this session
+        _call_language = None  # Will be updated from LLM response metadata
 
         # ---------------------------------------------------------------
         # Build voice pipeline (same for both inbound and outbound)
@@ -761,10 +1150,27 @@ async def my_agent(ctx: JobContext):
                     session.interrupt()
                 except Exception:
                     pass
-                session.generate_reply(user_input=message, input_modality="text")
 
-            for topic in CHAT_TOPICS:
-                ctx.room.register_text_stream_handler(topic, handle_chat_message)
+                if _has_crop_symptoms(message):
+                    logger.info(
+                        "Direct chat handoff to CropSpecialist: user=%s text=%r",
+                        user_id,
+                        message[:120],
+                    )
+                    await session.say(
+                        "Aapki fasal mein jo lakshan hain, uske liye main aapko hamare Fasal Visheshagya Arjun se jodti hoon.",
+                        allow_interruptions=False,
+                    )
+                    session.update_agent(
+                        CropSpecialist(
+                            chat_ctx=agent_instance.chat_ctx.copy(
+                                exclude_instructions=True
+                            )
+                        )
+                    )
+                    return
+
+                session.generate_reply(user_input=message, input_modality="text")
 
         # ---------------------------------------------------------------
         # Start session
@@ -785,6 +1191,24 @@ async def my_agent(ctx: JobContext):
             ),
         )
         print("SESSION STARTED")
+
+        # Set the agent's display name to Anisha so chat transcript shows the right label
+        try:
+            await ctx.room.local_participant.set_name("Anisha")
+            await ctx.room.local_participant.set_attributes({"speaker": "Anisha"})
+        except Exception:
+            pass
+
+        # Re-register chat handler AFTER session.start() so our handler wins
+        # over the SDK's default (which drops messages when text_input_cb is None).
+        if not is_outbound:
+            for topic in CHAT_TOPICS:
+                try:
+                    ctx.room.unregister_text_stream_handler(topic)
+                except Exception:
+                    pass
+            for topic in CHAT_TOPICS:
+                ctx.room.register_text_stream_handler(topic, handle_chat_message)
 
         # ---------------------------------------------------------------
         # Analytics: track agent speech to know if farmer got a response
@@ -887,11 +1311,15 @@ async def my_agent(ctx: JobContext):
             nonlocal _call_escalated
             if not tool_calls:
                 return
-            for tc in (tool_calls if hasattr(tool_calls, "__iter__") else []):
-                name = getattr(tc, "name", "") or getattr(getattr(tc, "function", None), "name", "")
+            for tc in tool_calls if hasattr(tool_calls, "__iter__") else []:
+                name = getattr(tc, "name", "") or getattr(
+                    getattr(tc, "function", None), "name", ""
+                )
                 if name == "create_escalation":
                     _call_escalated = True
-                    logger.info("Analytics: escalation detected for session=%s", session_id)
+                    logger.info(
+                        "Analytics: escalation detected for session=%s", session_id
+                    )
 
         # Speak greeting immediately after session starts.
         # For outbound: the call is already answered before we reach here, so
